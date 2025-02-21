@@ -13,18 +13,29 @@ class ToViewViewController: StandardVideoCollectionViewController<ToViewData> {
     override func setupCollectionView() {
         super.setupCollectionView()
         collectionVC.styleOverride = .sideBar
-        collectionVC.didSelect = {
-            [weak self] record in
-            self?.goDetail(with: record as! ToViewData)
+        collectionVC.didSelect = { [weak self] record in
+            guard let self,
+                  let record = record as? ToViewData
+            else { return }
+            goDetail(with: record)
         }
         collectionVC.didLongPress = {
             [weak self] record in
-            guard let self = self else { return }
-            let alert = UIAlertController(title: "Delete?", message: nil, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .default, handler: { _ in
-                self.del(with: record as! ToViewData)
-            }))
-            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+            guard let self else { return }
+            let deleteAction = UIAlertAction(title: NSLocalizedString("Delete", comment: "Delete Action"), style: .destructive) { [weak self] _ in
+                guard let self,
+                      let record = record as? ToViewData
+                else { return }
+                del(with: record)
+            }
+            let cancelAction = UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel Action"), style: .cancel)
+            let alert = UIAlertController(
+                title: NSLocalizedString("Confirm Delete", comment: "Delete Alert title"),
+                message: NSLocalizedString("Delete this video from your watch later list", comment: "Delete Alert message"),
+                preferredStyle: .alert
+            )
+            alert.addAction(deleteAction)
+            alert.addAction(cancelAction)
             self.present(alert, animated: true, completion: nil)
         }
     }
@@ -41,7 +52,7 @@ class ToViewViewController: StandardVideoCollectionViewController<ToViewData> {
     func del(with toViewItem: ToViewData) {
         let aid = toViewItem.aid
         guard let csrf = CookieHandler.shared.csrf() else { return }
-        AF.request("http://api.bilibili.com/x/v2/history/toview/del", method: .post, parameters: ["aid": aid, "csrf": csrf]).responseData {
+        AF.request("https://api.bilibili.com/x/v2/history/toview/del", method: .post, parameters: ["aid": aid, "csrf": csrf]).responseData {
             [weak self] resp in
             print(resp.result)
             self?.reloadData()
@@ -66,7 +77,10 @@ struct ToViewData: PlayableData, Codable {
     }
 
     var avatar: URL? {
-        return owner.face
+        if owner.face != nil {
+            return URL(string: owner.face!)
+        }
+        return nil
     }
 
     var date: String? {
@@ -77,9 +91,9 @@ struct ToViewData: PlayableData, Codable {
 extension WebRequest {
     static func requestToView() async throws -> [ToViewData] {
         struct Resp: Codable {
-            var list: [ToViewData]
+            var list: [ToViewData]?
         }
         let res: Resp = try await request(url: "https://api.bilibili.com/x/v2/history/toview")
-        return res.list
+        return res.list ?? []
     }
 }

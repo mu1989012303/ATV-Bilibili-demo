@@ -15,7 +15,7 @@ class DanmakuTextCellModel: DanmakuCellModel, Equatable {
 
     var text = ""
     var color: UIColor = .white
-    var font = UIFont.systemFont(ofSize: 36)
+    var font = UIFont.systemFont(ofSize: Settings.danmuSize.size)
 
     var cellClass: DanmakuCell.Type {
         return DanmakuTextCell.self
@@ -25,7 +25,7 @@ class DanmakuTextCellModel: DanmakuCellModel, Equatable {
 
     var track: UInt?
 
-    var displayTime: Double = 8
+    var displayTime: Double = Settings.danmuDuration
 
     var type: DanmakuCellType = .floating
 
@@ -47,6 +47,22 @@ class DanmakuTextCellModel: DanmakuCellModel, Equatable {
     init(str: String) {
         text = str
         type = .floating
+        calculateSize()
+    }
+
+    init(dm: Danmu) {
+        text = dm.isUp ? "up: " + dm.text : dm.text // TODO: UP主弹幕样式
+        color = UIColor(hex: dm.color)
+
+        switch dm.mode {
+        case 4:
+            type = .bottom
+        case 5:
+            type = .top
+        default:
+            type = .floating
+        }
+
         calculateSize()
     }
 }

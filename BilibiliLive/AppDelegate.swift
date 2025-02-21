@@ -33,9 +33,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         } else {
             window?.rootViewController = LoginViewController.create()
         }
+        WebRequest.requestIndex()
         window?.makeKeyAndVisible()
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         return true
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
     }
 
     func showLogin() {

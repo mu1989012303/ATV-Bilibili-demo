@@ -37,7 +37,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private var playlists = [String]()
     private var subtitles = [String: String]()
     private var videoInfo = [PlaybackInfo]()
-    private var segmentInfoCache = [VideoPlayURLInfo.DashInfo.DashMediaInfo: SidxParseUtil.Sidx]()
+    private var segmentInfoCache = SidxDownloader()
     private var hasAudioInMasterListAdded = false
     private(set) var playInfo: VideoPlayURLInfo?
     private var hasSubtitle = false
@@ -45,7 +45,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private var httpServer = HttpServer()
     private var aid = 0
     private(set) var httpPort = 0
-
+    private(set) var isHDR = false
     deinit {
         httpServer.stop()
     }
@@ -77,6 +77,9 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         // hdr 10 formate exp: hev1.2.4.L156.90
         //  Codec.Profile.Flags.TierLevel.Constraints
         let isHDR = isDolby || isHDR10
+        if isHDR {
+            self.isHDR = true
+        }
         var videoRange = isHDR ? "HLG" : "SDR"
         var codecs = info.codecs
         var supplementCodesc = ""
@@ -89,13 +92,17 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             }
         }
         if codecs == "dvh1.08.07" || codecs == "dvh1.08.03" {
-            supplementCodesc = codecs
-            videoRange = "HLG"
+            supplementCodesc = codecs + "/db4h"
             codecs = "hvc1.2.4.L153.b0"
+            videoRange = "HLG"
         } else if codecs == "dvh1.08.06" {
-            supplementCodesc = codecs
+            supplementCodesc = codecs + "/db1p"
             codecs = "hvc1.2.4.L150"
             videoRange = "PQ"
+        } else if codecs.hasPrefix("dvh1.05") {
+            videoRange = "PQ"
+        } else if isHDR {
+            Logger.warn("unknown hdr codecs: \(codecs)")
         }
 
         if let value = Double(framerate), value >= 60 {
@@ -115,19 +122,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     }
 
     private func getVideoPlayList(info: PlaybackInfo) async -> String {
-        var segment = segmentInfoCache[info.info]
-        if segment == nil {
-            let range = info.info.segment_base.index_range
-            if let res = try? await AF.request(info.url,
-                                               headers: ["Range": "bytes=\(range)",
-                                                         "Referer": "https://www.bilibili.com/video/av\(aid)"])
-                .serializingData().result.get()
-            {
-                segment = SidxParseUtil.processIndexData(data: res)
-            }
-        } else {
-            Logger.debug("cache hit")
-        }
+        let segment = await segmentInfoCache.sidx(from: info.info)
         let inits = info.info.segment_base.initialization.components(separatedBy: "-")
         guard let moovIdxStr = inits.last,
               let moovIdx = Int(moovIdxStr),
@@ -156,10 +151,10 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         #EXT-X-MEDIA-SEQUENCE:1
         #EXT-X-INDEPENDENT-SEGMENTS
         #EXT-X-PLAYLIST-TYPE:VOD
-        #EXT-X-MAP:URI="\(info.url)",BYTERANGE="\(moovIdx)@\(moovOffset)"
+        #EXT-X-MAP:URI="\(info.url)",BYTERANGE="\(moovIdx + 1)@\(moovOffset)"
 
         """
-
+        offset += 1
         for segInfo in segment.segments {
             let segStr = """
             #EXTINF:\(Double(segInfo.duration) / Double(segment.timescale)),
@@ -250,9 +245,12 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         reset()
         hasSubtitle = subtitles.count > 0
         var videos = info.dash.video
-        if Settings.preferHevc {
-            if videos.contains(where: { $0.isHevc }) {
-                videos.removeAll(where: { !$0.isHevc })
+        if Settings.preferAvc {
+            let videosMap = Dictionary(grouping: videos, by: { $0.id })
+            for (key, values) in videosMap {
+                if values.contains(where: { !$0.isHevc }) {
+                    videos.removeAll(where: { $0.id == key && $0.isHevc })
+                }
             }
         }
 
@@ -288,12 +286,24 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             httpPort = (try? httpServer.port()) ?? 0
         }
         for subtitle in subtitles {
-            addSubtitleData(lang: subtitle.lan, name: subtitle.lan_doc, duration: info.dash.duration, url: subtitle.url.absoluteString)
+            if let url = subtitle.url {
+                addSubtitleData(lang: subtitle.lan, name: subtitle.lan_doc, duration: info.dash.duration, url: url.absoluteString)
+            }
+        }
+
+        // i-frame
+        if let video = videos.last, let url = video.playableURLs.first {
+            let media = """
+            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=\(video.bandwidth),RESOLUTION=\(video.width!)x\(video.height!),URI="\(URLs.customDashPrefix)\(videoInfo.count)"
+
+            """
+            masterPlaylist.append(media)
+            videoInfo.append(PlaybackInfo(info: video, url: url, duration: info.dash.duration))
         }
 
         masterPlaylist.append("\n#EXT-X-ENDLIST\n")
 
-        Logger.debug("masterPlaylist:", masterPlaylist)
+        Logger.debug("masterPlaylist: \(masterPlaylist)")
     }
 
     private func reportError(_ loadingRequest: AVAssetResourceLoadingRequest, withErrorCode error: Int) {
@@ -372,7 +382,7 @@ private extension BilibiliVideoResourceLoaderDelegate {
             }
             return
         }
-        Logger.debug("handle loading", customUrl)
+        Logger.debug("handle loading \(customUrl)")
     }
 
     func bindHttpServer() {
@@ -434,5 +444,52 @@ extension VideoPlayURLInfo.DashInfo.DashMediaInfo {
 
     var isHevc: Bool {
         return codecs.starts(with: "hev") || codecs.starts(with: "hvc") || codecs.starts(with: "dvh1")
+    }
+}
+
+actor SidxDownloader {
+    private enum CacheEntry {
+        case inProgress(Task<SidxParseUtil.Sidx?, Never>)
+        case ready(SidxParseUtil.Sidx?)
+    }
+
+    private var cache: [VideoPlayURLInfo.DashInfo.DashMediaInfo: CacheEntry] = [:]
+
+    func sidx(from info: VideoPlayURLInfo.DashInfo.DashMediaInfo) async -> SidxParseUtil.Sidx? {
+        if let cached = cache[info] {
+            switch cached {
+            case let .ready(sidx):
+                Logger.debug("sidx cache hit \(info.id)")
+                return sidx
+            case let .inProgress(sidx):
+                Logger.debug("sidx cache wait \(info.id)")
+                return await sidx.value
+            }
+        }
+
+        let task = Task {
+            await downloadSidx(info: info)
+        }
+
+        cache[info] = .inProgress(task)
+
+        let sidx = await task.value
+        cache[info] = .ready(sidx)
+        Logger.debug("get sidx \(info.id)")
+        return sidx
+    }
+
+    private func downloadSidx(info: VideoPlayURLInfo.DashInfo.DashMediaInfo) async -> SidxParseUtil.Sidx? {
+        let range = info.segment_base.index_range
+        let url = info.playableURLs.first ?? info.base_url
+        if let res = try? await AF.request(url,
+                                           headers: ["Range": "bytes=\(range)",
+                                                     "Referer": "https://www.bilibili.com/"])
+            .serializingData().result.get()
+        {
+            let segment = SidxParseUtil.processIndexData(data: res)
+            return segment
+        }
+        return nil
     }
 }
